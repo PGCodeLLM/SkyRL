@@ -1,4 +1,5 @@
 import json
+import aiodocker
 import asyncio
 import uuid
 from collections import deque
@@ -8,6 +9,8 @@ import os
 import pandas as pd
 import tempfile
 import time
+import traceback
+import shutil
 
 import torch
 from tensordict import TensorDict
@@ -65,6 +68,10 @@ from openhands.events.action import CmdRunAction
 from openhands.events.observation import CmdOutputObservation
 from .utils import process_git_patch
 
+from mindforge_harness.run_instance import run_instance
+
+IS_MINDFORGE_HARNESS = os.environ.get('IS_MINDFORGE_HARNESS', 'true').lower() == 'true'
+
 DOCKER_IMAGE_PREFIX = os.environ.get('EVAL_DOCKER_IMAGE_PREFIX', 'docker.io/xingyaoww/')
 logger.info(f'Using docker image prefix: {DOCKER_IMAGE_PREFIX}')
 
@@ -105,6 +112,47 @@ chat_template_qwen3_thinking = (
     "{% endfor %}"
 )
 
+MONGO_URI = "mongodb://bmc:GwvDjDyUnm1GpRT6sMAq7rUo44EDmzuv02Tn9n5mmqvZyn3Zvsee4ozdCGFN57qXRqKEYethBPQfErCGE4oAr3feVuqjpcBuF2em@lux-2-cyber-04:26969/"
+DATABASE_NAME = "swe_gym_plus"
+COLLECTION_NAME = "train"
+
+async def run_mindforge_harness(docker_client, instance_args, patch):
+    try:
+        root_dir = tempfile.mkdtemp()
+        results = await run_instance(
+            client=docker_client,
+            repo=instance_args["repo"],
+            instance_id=instance_args["instance_id"],
+            base_commit=instance_args["base_commit"],
+            patches=[patch,instance_args["test_patch"]],
+            tests=instance_args["FAIL_TO_PASS"] + instance_args["PASS_TO_PASS"],
+            root_log_dir=root_dir,
+            version=instance_args.get("version", None),
+            spec_dict=instance_args.get("spec_dict", None),
+            timeout=300,
+            verbose=False,
+            short=True,
+            skipped_ok=True,
+            host_config= {"NetworkMode": "none", "NanoCpus": 2000000000, "Memory": 2147483648},
+        )
+        logger.info(f"Mindforge harness results for instance {instance_args['instance_id']}: {results}")
+        return results
+
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout running mindforge the evaluation")
+        return {
+            test : False
+            for test in instance_args["FAIL_TO_PASS"] + instance_args["PASS_TO_PASS"]
+        }
+    except Exception as e:
+        logger.error(f"Error running mindforge harness: {e}")
+        return {
+            test : False
+            for test in instance_args["FAIL_TO_PASS"] + instance_args["PASS_TO_PASS"]
+        }
+    finally:    
+        if root_dir:
+            shutil.rmtree(root_dir, ignore_errors=True)
     
 def convert_right_padding_to_left(tokenizer, input_ids, attention_mask, device, max_len=None):
     """
@@ -613,7 +661,8 @@ class CodeActAgentGroup:
         self.remove_think_tokens = remove_think_tokens
         if self.remove_think_tokens:
             logger.info("Removing think tokens....")
-    
+
+        self.docker = None
 
     def _convert_results_to_dataproto(self) -> DataProto:
         """
@@ -826,32 +875,33 @@ class CodeActAgentGroup:
         
         try:
             # Configure sandbox
-            RUN_WITH_BROWSING = os.environ.get('RUN_WITH_BROWSING', 'false').lower() == 'true'
-            SWE_BENCH_CONTAINER_IMAGE = 'ghcr.io/opendevin/eval-swe-bench:full-v1.2.1'
-            
-            if os.environ.get('USE_INSTANCE_IMAGE', 'true').lower() == 'true':
-                # Use a different instance image for each instance of swe-bench eval
-                base_container_image = get_instance_docker_image(instance_id)
-                logger.info(
-                    f'Using instance container image: {base_container_image}. '
-                    f'Please make sure this image exists. '
-                    f'Submit an issue on https://github.com/All-Hands-AI/OpenHands if you run into any issues.'
-                )
+            if not IS_MINDFORGE_HARNESS:
+                RUN_WITH_BROWSING = os.environ.get('RUN_WITH_BROWSING', 'false').lower() == 'true'
+                SWE_BENCH_CONTAINER_IMAGE = 'ghcr.io/opendevin/eval-swe-bench:full-v1.2.1'
+                
+                if os.environ.get('USE_INSTANCE_IMAGE', 'true').lower() == 'true':
+                    # Use a different instance image for each instance of swe-bench eval
+                    base_container_image = get_instance_docker_image(instance_id)
+                else:
+                    base_container_image = SWE_BENCH_CONTAINER_IMAGE
+                    logger.info(f'Using swe-bench container image: {base_container_image}')
             else:
-                base_container_image = SWE_BENCH_CONTAINER_IMAGE
-                logger.info(f'Using swe-bench container image: {base_container_image}')
+                base_container_image = instance['image']
+                if not self.docker:
+                    self.docker = aiodocker.Docker()
+            logger.info(f'Using instance container image: {base_container_image}.')    
             
             sandbox_config = get_default_sandbox_config_for_eval()
             sandbox_config.base_container_image = base_container_image
             sandbox_config.enable_auto_lint = True
-            sandbox_config.use_host_network = False
+            sandbox_config.use_host_network = True
             sandbox_config.platform = 'linux/amd64'
             
             app_config = AppConfig(
                 default_agent='OnlineCodeActAgent',
                 run_as_openhands=False,
                 max_iterations=self.max_iterations,
-                runtime='remote',
+                runtime='docker',
                 sandbox=sandbox_config,
                 workspace_base=None,
                 workspace_mount_path=None,
@@ -873,14 +923,18 @@ class CodeActAgentGroup:
             await runtime.connect()
             
             # Initialize runtime
-            from .utils import initialize_runtime, get_instruction
+            from .utils import initialize_runtime, get_instruction, initialize_harness_runtime
             # initialize_runtime(runtime, instance)
-            await call_sync_from_async(initialize_runtime, runtime, instance)
             
-            # Store the runtime and instruction
-            agent.runtime = runtime
-            agent.instruction = get_instruction(instance)
-            
+            if not IS_MINDFORGE_HARNESS:
+                await call_sync_from_async(initialize_runtime, runtime, instance)
+                agent.runtime = runtime
+                agent.istruction = get_instruction(instance, "/workspace/")
+            else:
+                await call_sync_from_async(initialize_harness_runtime, runtime, instance)
+                agent.runtime = runtime
+                agent.instruction = get_instruction(instance)
+
             logger.info(f"Successfully initialized runtime for instance {instance_id}")
         except Exception as e:
             logger.error(f"Failed to initialize runtime for instance {instance_id}: {str(e)}")
@@ -914,7 +968,7 @@ class CodeActAgentGroup:
             if state:
                 print(state.last_error)
             
-            from .utils import complete_runtime, is_fatal_evaluation_error
+            from .utils import complete_harness_runtime, is_fatal_evaluation_error, complete_runtime
             # Check for fatal errors
             if state and is_fatal_evaluation_error(state.last_error):
                 logger.error(f"Fatal error in agent {instance_id}: {state.last_error}")
@@ -922,7 +976,10 @@ class CodeActAgentGroup:
             
             final_messages = agent.get_final_messages(state)
             # Complete the runtime and get the git patch
-            return_val = await call_sync_from_async(complete_runtime, runtime, instance)
+            if not IS_MINDFORGE_HARNESS:
+                return_val = await call_sync_from_async(complete_harness_runtime, runtime, instance)
+            else:
+                return_val = await call_sync_from_async(complete_runtime, runtime, instance)
             # return_val = complete_runtime(runtime, instance)
             # print patch
             if return_val.get('git_patch', None):
@@ -1289,8 +1346,16 @@ class CodeActAgentGroup:
             start_time = time.time()
             try:
                 logger.info(f"Evaluating agent for instance {instance_id}, trajectory {trajectory_id}")
-                await self._evaluate_agent(batch_idx, trajectory_id)
-                elapsed = time.time() - start_time
+                if not IS_MINDFORGE_HARNESS:
+                    await self._evaluate_agent(batch_idx, trajectory_id)
+                else:
+                    instance = pd.Series(self.batch[batch_idx].non_tensor_batch['instance'])
+                    model_patch = self.results[instance_id][trajectory_id].get('git_patch', None)
+                    if not model_patch:
+                        raise Exception(f"No git patch found for instance {instance_id}, trajectory {trajectory_id}")
+                    results = await run_mindforge_harness(self.docker, instance, model_patch)
+                    self.results[instance_id][trajectory_id]['resolved'] = results['all_tests']
+                    elapsed = time.time() - start_time
                 
                 print(f"Successfully completed evaluating instance {instance_id}, trajectory {trajectory_id} in {elapsed:.2f}s")
             except Exception as e:

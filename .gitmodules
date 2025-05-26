@@ -1,3 +1,6 @@
 [submodule "SkyRL-OpenHands"]
 	path = SkyRL-OpenHands
 	url = https://github.com/NovaSky-AI/SkyRL-OpenHands
+[submodule "mindforge_harness"]
+	path = mindforge_harness
+	url = https://github.com/PGCodeLLM/mindforge_harness.git

@@ -56,8 +56,9 @@ RUN_WITH_BROWSING = os.environ.get('RUN_WITH_BROWSING', 'false').lower() == 'tru
 def _get_swebench_workspace_dir_name(instance: pd.Series) -> str:
     return f'{instance.repo}__{instance.version}'.replace('/', '__')
 
-def get_instruction(instance: pd.Series):
-    workspace_dir_name = _get_swebench_workspace_dir_name(instance)
+def get_instruction(instance: pd.Series, workspace_dir_name=None):
+    if not workspace_dir_name:
+        workspace_dir_name = _get_swebench_workspace_dir_name(instance)
     instruction = f"""
 <uploaded_files>
 /workspace/{workspace_dir_name}
@@ -118,6 +119,141 @@ You SHOULD NEVER attempt to browse the web.
 </IMPORTANT!>
 """
     return instruction
+
+def initialize_harness_runtime(
+    runtime: Runtime,
+    instance: pd.Series,
+):
+    logger.info('-' * 30)
+    logger.info('BEGIN Harness Runtime Initialization Fn')
+    logger.info('-' * 30)
+    obs: CmdOutputObservation
+
+    action = CmdRunAction(
+        command=f"""echo 'export SWE_INSTANCE_ID={instance['instance_id']}' >> ~/.bashrc && echo 'export PIP_CACHE_DIR=~/.cache/pip' >> ~/.bashrc && echo "alias git='git --no-pager'" >> ~/.bashrc"""
+    )
+    action = CmdRunAction(command='git reset --hard')
+    action.set_hard_timeout(600)
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+    assert_and_raise(obs.exit_code == 0, f'Failed to git reset --hard: {str(obs)}')
+
+    action = CmdRunAction(
+        command='for remote_name in $(git remote); do git remote remove "${remote_name}"; done'
+    )
+    action.set_hard_timeout(600)
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+    assert_and_raise(obs.exit_code == 0, f'Failed to remove git remotes: {str(obs)}')
+
+    action = CmdRunAction(command="export PATH=/usr/local/bin:$PATH && which python")
+    action.set_hard_timeout(600)
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+    assert_and_raise(
+        obs.exit_code == 0 and '/usr/local/bin/python' in obs.content,
+        f'Expected to find python interpreter from /usr/local/bin/python, but got: {str(obs)}',
+    )
+
+    logger.info('-' * 30)
+    logger.info('END Harness Runtime Initialization Fn')
+    logger.info('-' * 30)
+
+def complete_harness_runtime(
+    runtime: Runtime,
+    instance: pd.Series,  # this argument is not required, but it is used to get the workspace_dir_name
+) -> dict[str, Any]:
+    """Complete the runtime for the agent.
+
+    This function is called before the runtime is used to run the agent.
+    If you need to do something in the sandbox to get the correctness metric after
+    the agent has run, modify this function.
+    """
+    logger.info('-' * 30)
+    logger.info('BEGIN Harness Runtime Completion Fn')
+    logger.info('-' * 30)
+    obs: CmdOutputObservation
+
+    action = CmdRunAction(command=f'cd /workspace/')
+    action.set_hard_timeout(600)
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+
+    if obs.exit_code == -1:
+        # The previous command is still running
+        # We need to kill previous command
+        logger.info('The previous command is still running, trying to kill it...')
+        action = CmdRunAction(command='C-c')
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+
+        # Then run the command again
+        action = CmdRunAction(command=f'cd /workspace/')
+        action.set_hard_timeout(600)
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+
+    assert_and_raise(
+        isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
+        f'Failed to cd to /workspace/: {str(obs)}',
+    )
+
+    action = CmdRunAction(command='git config --global core.pager ""')
+    action.set_hard_timeout(600)
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+    assert_and_raise(
+        isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
+        f'Failed to git config --global core.pager "": {str(obs)}',
+    )
+
+    action = CmdRunAction(command='git add -A')
+    action.set_hard_timeout(600)
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+    assert_and_raise(
+        isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
+        f'Failed to git add -A: {str(obs)}',
+    )
+
+    n_retries = 0
+    git_patch = None
+    while n_retries < 5:
+        action = CmdRunAction(
+            command=f'git diff --no-color --cached {instance["base_commit"]}'
+        )
+        action.set_hard_timeout(max(300 + 100 * n_retries, 600))
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        n_retries += 1
+        if isinstance(obs, CmdOutputObservation):
+            if obs.exit_code == 0:
+                git_patch = obs.content.strip()
+                break
+            else:
+                logger.info('Failed to get git diff, retrying...')
+                sleep_if_should_continue(10)
+        elif isinstance(obs, ErrorObservation):
+            logger.error(f'Error occurred: {obs.content}. Retrying...')
+            sleep_if_should_continue(10)
+        else:
+            assert_and_raise(False, f'Unexpected observation type: {str(obs)}')
+
+    assert_and_raise(git_patch is not None, 'Failed to get git diff (None)')
+
+    logger.info('-' * 30)
+    logger.info('END Runtime Completion Fn')
+    logger.info('-' * 30)
+    return {'git_patch': git_patch}
+
 
 def initialize_runtime(
     runtime: Runtime,
