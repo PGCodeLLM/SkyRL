@@ -80,7 +80,7 @@ class ActorRolloutRefWorker(Worker):
         import torch.distributed
         if not torch.distributed.is_initialized():
             from datetime import timedelta
-            torch.distributed.init_process_group(timeout=timedelta(minutes=120))
+            torch.distributed.init_process_group(timeout=timedelta(minutes=30), backend='nccl', init_method='env://')
 
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
@@ -558,10 +558,11 @@ class ActorRolloutRefWorker(Worker):
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
             output = self.rollout.generate_sequences(prompts=prompts)
+            print("after rollout generation")
             log_gpu_memory_usage('After rollout generation', logger=logger)
 
             output = self.rollout_sharding_manager.postprocess_data(output)
-
+            print("after rollout postprocess")
         output = output.to('cpu')
 
         # clear kv cache

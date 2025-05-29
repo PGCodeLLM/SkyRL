@@ -44,7 +44,7 @@ dependencies=[
   "hf_transfer",
   "torchdata",
   "openhands-ai",
-  'sglang[all]>=0.4.6.post1', 
+  'sglang[all]>=0.4.6.post1',
   "flash-attn@https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.5cxx11abifalse-cp312-cp312-linux_x86_64.whl",
   "streamlit",
   "whatthepatch",
@@ -65,7 +65,8 @@ dependencies=[
   "browsergym-visualwebarena==0.10.2",
   'tensordict<=0.6.2',
   'torch-memory-saver>=0.0.5',
-  'vllm>=0.7.3'
+  'vllm>=0.7.3',
+  "mindforge-harness",
 ]
 
 [tool.uv]
@@ -75,6 +76,7 @@ override-dependencies = ["ray==2.43.0", "flash-attn@https://github.com/Dao-AILab
 
 [tool.uv.sources]
 openhands-ai = { path = "./SkyRL-OpenHands", editable = true }
+mindforge-harness = { path = "Mindforge" }
 
 # -------------------------------
 # tool.setuptools - Additional config

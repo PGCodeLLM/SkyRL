@@ -53,10 +53,10 @@ def assert_and_raise(condition: bool, msg: str):
 
 RUN_WITH_BROWSING = os.environ.get('RUN_WITH_BROWSING', 'false').lower() == 'true'
 
-def _get_swebench_workspace_dir_name(instance: pd.Series) -> str:
-    return f'{instance.repo}__{instance.version}'.replace('/', '__')
+def _get_swebench_workspace_dir_name(instance: dict) -> str:
+    return f'{instance["repo"]}__{instance["version"]}'.replace('/', '__')
 
-def get_instruction(instance: pd.Series, workspace_dir_name=None):
+def get_instruction(instance: dict, workspace_dir_name=None):
     if not workspace_dir_name:
         workspace_dir_name = _get_swebench_workspace_dir_name(instance)
     instruction = f"""
@@ -67,7 +67,7 @@ def get_instruction(instance: pd.Series, workspace_dir_name=None):
 I've uploaded a python code repository in the directory {workspace_dir_name}. Consider the following issue description:
 
 <issue_description>
-{instance.problem_statement}
+{instance["problem_statement"]}
 </issue_description>
 
 Can you help me implement the necessary changes to the repository so that the requirements specified in the <issue_description> are met?
@@ -122,22 +122,33 @@ You SHOULD NEVER attempt to browse the web.
 
 def initialize_harness_runtime(
     runtime: Runtime,
-    instance: pd.Series,
+    instance: dict,
 ):
     logger.info('-' * 30)
     logger.info('BEGIN Harness Runtime Initialization Fn')
     logger.info('-' * 30)
     obs: CmdOutputObservation
 
-    action = CmdRunAction(
-        command=f"""echo 'export SWE_INSTANCE_ID={instance['instance_id']}' >> ~/.bashrc && echo 'export PIP_CACHE_DIR=~/.cache/pip' >> ~/.bashrc && echo "alias git='git --no-pager'" >> ~/.bashrc"""
-    )
+    action = CmdRunAction(command=f'git checkout {instance["base_commit"]}')
+    action.set_hard_timeout(600)
+    # logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    # logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+    assert_and_raise(obs.exit_code == 0, f'Failed to git checkout {instance["base_commit"]}: {str(obs)}')
+
     action = CmdRunAction(command='git reset --hard')
     action.set_hard_timeout(600)
     logger.info(action, extra={'msg_type': 'ACTION'})
     obs = runtime.run_action(action)
     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
     assert_and_raise(obs.exit_code == 0, f'Failed to git reset --hard: {str(obs)}')
+
+    action = CmdRunAction(command='git clean -f -f -d') # Remove all untracked files which may result in patch error
+    action.set_hard_timeout(600)
+    logger.info(action, extra={'msg_type': 'ACTION'})
+    obs = runtime.run_action(action)
+    logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+    assert_and_raise(obs.exit_code == 0, f'Failed to git clean -f -f -d: {str(obs)}')
 
     action = CmdRunAction(
         command='for remote_name in $(git remote); do git remote remove "${remote_name}"; done'
@@ -164,7 +175,7 @@ def initialize_harness_runtime(
 
 def complete_harness_runtime(
     runtime: Runtime,
-    instance: pd.Series,  # this argument is not required, but it is used to get the workspace_dir_name
+    instance: dict,  # this argument is not required, but it is used to get the workspace_dir_name
 ) -> dict[str, Any]:
     """Complete the runtime for the agent.
 
@@ -257,7 +268,7 @@ def complete_harness_runtime(
 
 def initialize_runtime(
     runtime: Runtime,
-    instance: pd.Series,  # this argument is not required
+    instance: dict,  # this argument is not required
 ):
     """Initialize the runtime for the agent.
 
@@ -401,7 +412,7 @@ def initialize_runtime(
 
 def complete_runtime(
     runtime: Runtime,
-    instance: pd.Series,  # this argument is not required, but it is used to get the workspace_dir_name
+    instance: dict,  # this argument is not required, but it is used to get the workspace_dir_name
 ) -> dict[str, Any]:
     """Complete the runtime for the agent.
 

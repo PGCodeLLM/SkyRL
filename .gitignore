@@ -2,7 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+outputs/
 # C extensions
 *.so
 
@@ -234,3 +234,5 @@ containers/runtime/project.tar.gz
 containers/runtime/code
 **/node_modules/
 **/__pycache__/
+
+wandb/

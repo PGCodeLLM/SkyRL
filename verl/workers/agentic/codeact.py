@@ -70,8 +70,6 @@ from .utils import process_git_patch
 
 from mindforge_harness.run_instance import run_instance
 
-IS_MINDFORGE_HARNESS = os.environ.get('IS_MINDFORGE_HARNESS', 'true').lower() == 'true'
-
 DOCKER_IMAGE_PREFIX = os.environ.get('EVAL_DOCKER_IMAGE_PREFIX', 'docker.io/xingyaoww/')
 logger.info(f'Using docker image prefix: {DOCKER_IMAGE_PREFIX}')
 
@@ -112,13 +110,16 @@ chat_template_qwen3_thinking = (
     "{% endfor %}"
 )
 
-MONGO_URI = "mongodb://bmc:GwvDjDyUnm1GpRT6sMAq7rUo44EDmzuv02Tn9n5mmqvZyn3Zvsee4ozdCGFN57qXRqKEYethBPQfErCGE4oAr3feVuqjpcBuF2em@lux-2-cyber-04:26969/"
-DATABASE_NAME = "swe_gym_plus"
-COLLECTION_NAME = "train"
-
 async def run_mindforge_harness(docker_client, instance_args, patch):
+
     try:
+        with open("patches.txt", "a") as f:
+            f.write(f"instance_id: {instance_args['instance_id']}")
+            f.write('-'*30)
+            f.write(patch)
+            f.write('-'*30)
         root_dir = tempfile.mkdtemp()
+        logger.info(f"instance_id: {instance_args['instance_id']} saved to {root_dir}")
         results = await run_instance(
             client=docker_client,
             repo=instance_args["repo"],
@@ -127,7 +128,6 @@ async def run_mindforge_harness(docker_client, instance_args, patch):
             patches=[patch,instance_args["test_patch"]],
             tests=instance_args["FAIL_TO_PASS"] + instance_args["PASS_TO_PASS"],
             root_log_dir=root_dir,
-            version=instance_args.get("version", None),
             spec_dict=instance_args.get("spec_dict", None),
             timeout=300,
             verbose=False,
@@ -490,7 +490,9 @@ class OnlineCodeActAgent(Agent):
 
         # if we're done, go back
         latest_user_message = state.get_last_user_message()
-        if latest_user_message and latest_user_message.content.strip() == '/exit':
+        # if latest_user_message and not latest_user_message.content:
+        #     logger.error(f"instance id {self.instance_id}, trajectory {self.trajectory_id}, step {self.step_count}, latest_user_message: {latest_user_message}")
+        if latest_user_message and latest_user_message.content and latest_user_message.content.strip() == '/exit':
             return AgentFinishAction()
 
         # prepare what we want to send to the LLM
@@ -695,8 +697,8 @@ class CodeActAgentGroup:
         matched_results = []
         instance_list = []
         for batch_item in self.batch:
-            instance_id = batch_item.non_tensor_batch['instance']['instance_id']
-            instance = batch_item.non_tensor_batch['instance']
+            instance = json.loads(batch_item.non_tensor_batch['instance'])
+            instance_id = instance['instance_id']
             if instance_id in instance_trajectories:
                 # Add all trajectories for this instance
                 traj_results = instance_trajectories[instance_id]
@@ -851,7 +853,8 @@ class CodeActAgentGroup:
     def _initialize_agents(self) -> None:
         """Initialize agent instances for each task."""
         for data_item in self.batch:
-            instance_id = data_item.non_tensor_batch['instance']['instance_id']
+            instance = json.loads(data_item.non_tensor_batch['instance'])
+            instance_id = instance['instance_id']
             self.agents[instance_id] = {}
             for n in range(self.num_trajectories):
                 self.agents[instance_id][n] = OnlineCodeActAgent(
@@ -869,13 +872,14 @@ class CodeActAgentGroup:
     
     async def _initialize_runtime_for_agent(self, batch_id: int, trajectory_id: int) -> None:
         """Initialize the runtime for a specific agent."""
-        instance_id = self.batch[batch_id].non_tensor_batch['instance']['instance_id']
-        instance = pd.Series(self.batch[batch_id].non_tensor_batch['instance'])
+        instance = json.loads(self.batch[batch_id].non_tensor_batch['instance'])
+        instance_id = instance['instance_id']
+        is_swegym = instance['data_source'] == 'swe-gym'
         agent = self.agents[instance_id][trajectory_id]
         
         try:
             # Configure sandbox
-            if not IS_MINDFORGE_HARNESS:
+            if is_swegym:
                 RUN_WITH_BROWSING = os.environ.get('RUN_WITH_BROWSING', 'false').lower() == 'true'
                 SWE_BENCH_CONTAINER_IMAGE = 'ghcr.io/opendevin/eval-swe-bench:full-v1.2.1'
                 
@@ -926,7 +930,7 @@ class CodeActAgentGroup:
             from .utils import initialize_runtime, get_instruction, initialize_harness_runtime
             # initialize_runtime(runtime, instance)
             
-            if not IS_MINDFORGE_HARNESS:
+            if is_swegym:
                 await call_sync_from_async(initialize_runtime, runtime, instance)
                 agent.runtime = runtime
                 agent.istruction = get_instruction(instance, "/workspace/")
@@ -948,11 +952,12 @@ class CodeActAgentGroup:
             raise
     
     async def _run_agent(self, batch_id: int, trajectory_id: int, pos_id: int) -> Dict[str, Any]:
-        instance_id = self.batch[batch_id].non_tensor_batch['instance']['instance_id']
+        instance = json.loads(self.batch[batch_id].non_tensor_batch['instance'])
+        instance_id = instance['instance_id']
         """Run a single agent to completion and return the results."""
         agent = self.agents[instance_id][trajectory_id]
         assert agent is not None
-        instance = pd.Series(self.batch[batch_id].non_tensor_batch['instance'])
+        is_swegym = instance['data_source'] == 'swe-gym'
         runtime = agent.runtime
         
         try:
@@ -976,10 +981,10 @@ class CodeActAgentGroup:
             
             final_messages = agent.get_final_messages(state)
             # Complete the runtime and get the git patch
-            if not IS_MINDFORGE_HARNESS:
-                return_val = await call_sync_from_async(complete_harness_runtime, runtime, instance)
-            else:
+            if is_swegym:
                 return_val = await call_sync_from_async(complete_runtime, runtime, instance)
+            else:
+                return_val = await call_sync_from_async(complete_harness_runtime, runtime, instance)
             # return_val = complete_runtime(runtime, instance)
             # print patch
             if return_val.get('git_patch', None):
@@ -999,6 +1004,7 @@ class CodeActAgentGroup:
                 'finish': agent._is_last_action_finish(state)
             }
         except Exception as e:
+            traceback.print_exc()
             logger.error(f"Error running agent {instance_id}: {str(e)}")
             # Update agent state to reflect error
             agent.error = str(e)
@@ -1167,8 +1173,8 @@ class CodeActAgentGroup:
     
     async def _evaluate_agent(self, batch_id: int, trajectory_id: int) -> None:
         """Initialize the runtime for a specific agent."""
-        instance_id = self.batch[batch_id].non_tensor_batch['instance']['instance_id']
-        instance = pd.Series(self.batch[batch_id].non_tensor_batch['instance'])
+        instance = json.loads(self.batch[batch_id].non_tensor_batch['instance'])
+        instance_id = instance['instance_id']
         test_spec = make_test_spec(instance=instance)
         
         try:
@@ -1183,9 +1189,10 @@ class CodeActAgentGroup:
             sandbox_config = get_default_sandbox_config_for_eval()
             sandbox_config.base_container_image = base_container_image
             sandbox_config.remote_runtime_resource_factor = 1
+            sandbox_config.use_host_network = True
             config = AppConfig(
                 run_as_openhands=False,
-                runtime="remote",
+                runtime="docker",
                 sandbox=sandbox_config,
                 # do not mount workspace
                 workspace_base=None,
@@ -1255,7 +1262,8 @@ class CodeActAgentGroup:
         async def initialize_one_runtime():
             start_time = time.time()
             batch_idx, trajectory_id = await init_queue.get()
-            instance_id = self.batch[batch_idx].non_tensor_batch['instance']['instance_id']
+            instance = json.loads(self.batch[batch_idx].non_tensor_batch['instance'])
+            instance_id = instance['instance_id']
             try:
                 logger.info(f"Initializing runtime for instance {instance_id}, trajectory {trajectory_id}")
                 await self._initialize_runtime_for_agent(batch_idx, trajectory_id)
@@ -1296,7 +1304,8 @@ class CodeActAgentGroup:
         # Helper function to run one agent
         async def run_one_agent(pos_id: int):
             batch_idx, trajectory_id = await run_queue.get()
-            instance_id = self.batch[batch_idx].non_tensor_batch['instance']['instance_id']
+            instance = json.loads(self.batch[batch_idx].non_tensor_batch['instance'])
+            instance_id = instance['instance_id']
             start_time = time.time()
             try:
                 logger.info(f"Running agent for instance {instance_id}, trajectory {trajectory_id}")
@@ -1342,20 +1351,21 @@ class CodeActAgentGroup:
         # Helper function to eval one trajectory
         async def eval_one_agent():
             batch_idx, trajectory_id = await eval_queue.get()
-            instance_id = self.batch[batch_idx].non_tensor_batch['instance']['instance_id']
+            instance = json.loads(self.batch[batch_idx].non_tensor_batch['instance'])
+            instance_id = instance['instance_id']
+            is_swegym = instance['data_source'] == 'swe-gym'
             start_time = time.time()
             try:
                 logger.info(f"Evaluating agent for instance {instance_id}, trajectory {trajectory_id}")
-                if not IS_MINDFORGE_HARNESS:
+                if is_swegym:
                     await self._evaluate_agent(batch_idx, trajectory_id)
                 else:
-                    instance = pd.Series(self.batch[batch_idx].non_tensor_batch['instance'])
                     model_patch = self.results[instance_id][trajectory_id].get('git_patch', None)
                     if not model_patch:
                         raise Exception(f"No git patch found for instance {instance_id}, trajectory {trajectory_id}")
                     results = await run_mindforge_harness(self.docker, instance, model_patch)
-                    self.results[instance_id][trajectory_id]['resolved'] = results['all_tests']
-                    elapsed = time.time() - start_time
+                    self.results[instance_id][trajectory_id]['resolved'] = all(res for res in results.values())
+                elapsed = time.time() - start_time
                 
                 print(f"Successfully completed evaluating instance {instance_id}, trajectory {trajectory_id} in {elapsed:.2f}s")
             except Exception as e:
@@ -1410,7 +1420,16 @@ class CodeActAgentGroup:
         all_tasks = all_tasks.union(active_eval_tasks)
         if all_tasks:
             logger.info(f"Waiting for {len(all_tasks)} (init: {len(active_init_tasks)}, run: {len(active_run_tasks)}, eval: {len(active_eval_tasks)}) remaining tasks to complete")
-            await asyncio.wait(all_tasks)
+            try:
+                timeout = 900
+                done, pending = await asyncio.wait(all_tasks, timeout=timeout)
+                if pending:
+                    logger.error(f"Pending tasks: {pending}")
+                    for task in pending:
+                        logger.error(f"Cancelling task {task}")
+                        task.cancel()
+            except Exception as e:
+                logger.error(f"Error waiting for tasks to complete: {str(e)}")
         
         results_dataproto = self._convert_results_to_dataproto()
         return results_dataproto

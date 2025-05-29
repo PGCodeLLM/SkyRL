@@ -61,6 +61,7 @@ def run_ppo(config) -> None:
     os.environ["ENSURE_CUDA_VISIBLE_DEVICES"] = os.environ.get('CUDA_VISIBLE_DEVICES', '')
     if not ray.is_initialized():
         # this is for local ray cluster
+        import mindforge_harness
         ray.init(
             runtime_env={
                 'env_vars': {
@@ -68,7 +69,8 @@ def run_ppo(config) -> None:
                     'NCCL_DEBUG': 'WARN',
                     'VLLM_LOGGING_LEVEL': 'WARN',
                     **dict(os.environ)
-                }
+                },
+                "py_modules": [mindforge_harness]
             })
 
     runner = TaskRunner.remote()
