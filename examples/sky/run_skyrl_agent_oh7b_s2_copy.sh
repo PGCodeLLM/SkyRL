@@ -1,15 +1,20 @@
-PROJECT_NAME='oh-7b-training'
-EXPERIMENT_NAME='SkyRL-Agent-7b-v0-stage1'
-DATA_PATH="/shared_workspace/datasets/SkyRL-mindforge-harness-easy-data"
-SFT_MODEL_PATH='NovaSky-AI/SWE-Gym-OpenHands-7B-Agent'
-CKPT_PATH='/home/original_models/chengzong/sky-rl/stage1'
+PROJECT_NAME='oh-7b-training-s2'
+EXPERIMENT_NAME='SkyRL-Agent-7b-v0-stage2'
+DATA_PATH="/shared_workspace/datasets/SkyRL-v0-220-data"
+SFT_MODEL_PATH='/home/original_models/skyrl-hf-stage2-global_step_72'
+CKPT_PATH='/home/original_models/chengzong/sky-rl/stage2'   
 LATEST_ITER=$(cat $CKPT_PATH/$PROJECT_NAME/$EXPERIMENT_NAME/latest_checkpointed_iteration.txt)
 LOAD_CKPT_PATH=$CKPT_PATH/$PROJECT_NAME/$EXPERIMENT_NAME/global_step_$LATEST_ITER
+SAMPLING_CHECKPOINT_PATH='/shared_workspace/chengzong/skyrlrollout-s2/'
+
+export SAMPLING_CHECKPOINT_PATH
+LATEST_ITER_PATH=$CKPT_PATH/$PROJECT_NAME/$EXPERIMENT_NAME/latest_checkpointed_iteration.txt
+export LATEST_ITER_PATH
 
 BATCH_SIZE=8
-MAX_NUM_ITERS=15
+MAX_NUM_ITERS=25
 NUM_TRAJ=16
-MAX_PARALLEL_AGENTS=16
+MAX_PARALLEL_AGENTS=32
 SAVE_FREQ=1
 
 USE_KL_LOSS=True
@@ -35,7 +40,7 @@ PYTHONUNBUFFERED=1 uv run --isolated --directory . --frozen --env-file .env -m v
     data.train_files=["$DATA_PATH/train.parquet"] \
     data.val_files=["$DATA_PATH/validation.parquet"] \
     data.train_batch_size=$BATCH_SIZE \
-    data.max_prompt_length=15616 \
+    data.max_prompt_length=31232 \
     data.max_response_length=1536 \
     data.truncation='error' \
     actor_rollout_ref.model.path=$SFT_MODEL_PATH \
@@ -78,8 +83,7 @@ PYTHONUNBUFFERED=1 uv run --isolated --directory . --frozen --env-file .env -m v
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.default_local_dir=$CKPT_PATH/$PROJECT_NAME/$EXPERIMENT_NAME \
-    trainer.resume_mode=resume_path \
-    trainer.resume_from_path=$LOAD_CKPT_PATH \
+    trainer.resume_mode=auto \
     trainer.max_actor_ckpt_to_keep=10 \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=$NNODES \
@@ -87,4 +91,4 @@ PYTHONUNBUFFERED=1 uv run --isolated --directory . --frozen --env-file .env -m v
     data.dataloader_num_workers=0 \
     actor_rollout_ref.exchange_size=200000000 \
     trainer.test_freq=-1 \
-    trainer.total_epochs=16 $@
+    trainer.total_epochs=2 $@

@@ -80,7 +80,15 @@ class BaseCheckpointManager:
             print(f'Checkpoint manager remove previous save local path: {abs_path}')
             if not os.path.exists(abs_path):
                 continue
-            shutil.rmtree(abs_path, ignore_errors=True)
+            # Remove the parent directory if it is empty
+            parent = os.path.dirname(abs_path)
+            try:
+                if int(parent.split('_')[-1]) % 10 == 0:
+                    continue
+            except Exception as e:
+                pass
+            if os.path.isdir(parent):
+                shutil.rmtree(parent, ignore_errors=True)
 
     @staticmethod
     def local_mkdir(path):

@@ -1,12 +1,18 @@
-PROJECT_NAME='oh-7b-training'
+PROJECT_NAME='oh-7b-training-s2'
 EXPERIMENT_NAME='SkyRL-Agent-7b-v0-stage2'
-DATA_PATH="<path_to_swegym_dataset>"
-SFT_MODEL_PATH='PATH_FROM_STAGE1'
-CKPT_PATH='<path_to_ckpt>'
+DATA_PATH="/shared_workspace/datasets/SkyRL-mindforge-harness-data"
+SFT_MODEL_PATH='NovaSky-AI/SWE-Gym-OpenHands-7B-Agent'
+CKPT_PATH='/home/original_models/chengzong/sky-rl/stage2'   
+LATEST_ITER=$(cat $CKPT_PATH/$PROJECT_NAME/$EXPERIMENT_NAME/latest_checkpointed_iteration.txt)
+LOAD_CKPT_PATH=$CKPT_PATH/$PROJECT_NAME/$EXPERIMENT_NAME/global_step_$LATEST_ITER
+SAMPLING_CHECKPOINT_PATH='/shared_workspace/chengzong/skyrlrollout-s2/'
 
+export SAMPLING_CHECKPOINT_PATH
+LATEST_ITER_PATH=$CKPT_PATH/$PROJECT_NAME/$EXPERIMENT_NAME/latest_checkpointed_iteration.txt
+export LATEST_ITER_PATH
 
-BATCH_SIZE=16
-MAX_NUM_ITERS=25
+BATCH_SIZE=8
+MAX_NUM_ITERS=15
 NUM_TRAJ=16
 MAX_PARALLEL_AGENTS=64
 SAVE_FREQ=1
@@ -18,7 +24,7 @@ ENTROPY_COEFF=0
 CLIP_RATIO_LOW=0.2
 CLIP_RATIO_HIGH=0.2
 
-GPU_MEM_UTIL=0.8
+GPU_MEM_UTIL=0.6
 TP_SIZE=1
 # Assumes a h200 node
 # For 2xH100: change tp size -> 2, sequence parallel size -> 2, nnodes -> 2
@@ -34,7 +40,7 @@ PYTHONUNBUFFERED=1 uv run --isolated --directory . --frozen --env-file .env -m v
     data.train_files=["$DATA_PATH/train.parquet"] \
     data.val_files=["$DATA_PATH/validation.parquet"] \
     data.train_batch_size=$BATCH_SIZE \
-    data.max_prompt_length=31232 \
+    data.max_prompt_length=15616 \
     data.max_response_length=1536 \
     data.truncation='error' \
     actor_rollout_ref.model.path=$SFT_MODEL_PATH \
@@ -77,12 +83,13 @@ PYTHONUNBUFFERED=1 uv run --isolated --directory . --frozen --env-file .env -m v
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.default_local_dir=$CKPT_PATH/$PROJECT_NAME/$EXPERIMENT_NAME \
-    trainer.resume_mode=auto \
+    trainer.resume_mode=resume_path \
+    trainer.resume_from_path=$LOAD_CKPT_PATH \
     trainer.max_actor_ckpt_to_keep=10 \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=$NNODES \
     trainer.save_freq=$SAVE_FREQ \
     data.dataloader_num_workers=0 \
-    actor_rollout_ref.exchange_size=500000000 \
+    actor_rollout_ref.exchange_size=200000000 \
     trainer.test_freq=-1 \
-    trainer.total_epochs=100 $@
+    trainer.total_epochs=1 $@

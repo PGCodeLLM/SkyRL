@@ -1,77 +1,28 @@
 import json
-import aiodocker
 import asyncio
-import uuid
-from collections import deque
 from pathlib import Path
-from typing import Any, List, Dict, Optional, Set, Callable, Tuple
-import os
-import pandas as pd
-import tempfile
-import time
-import traceback
-import shutil
-
+from typing import Any, Dict
 import torch
-from tensordict import TensorDict
+import os
 from verl import DataProto
 from verl.utils.model import compute_position_id_with_mask
-import verl.utils.torch_functional as verl_F
-import torch.nn.functional as F
-from transformers import AutoTokenizer
+import logging
 
-import openhands
-import openhands.agenthub.codeact_agent.function_calling as codeact_function_calling
-from openhands.controller.agent import Agent
-from openhands.controller.state.state import State, AgentState
-from openhands.core.config import LLMConfig, AgentConfig, SandboxConfig, AppConfig
-from openhands.core.main import create_runtime, run_controller
-from openhands.core.logger import openhands_logger as logger
-from openhands.core.message import Message, TextContent
-from openhands.core.message_utils import (
-    events_to_messages,
-)
-from openhands.core.exceptions import (
-    AgentStuckInLoopError,
-    FunctionCallNotExistsError,
-    FunctionCallValidationError,
-    LLMContextWindowExceedError,
-    LLMMalformedActionError,
-    LLMNoActionError,
-    LLMResponseError,
-)
-from openhands.events.action import (
-    Action,
-    AgentFinishAction,
-    MessageAction,
-)
-from openhands.events.event import EventSource
-from openhands.memory.condenser import Condenser
-from openhands.core.config.condenser_config import (
-    NoOpCondenserConfig,
-)
-from openhands.llm.fn_call_converter import (
-    convert_fncall_messages_to_non_fncall_messages,
-    convert_non_fncall_messages_to_fncall_messages,
-)
-from openhands.llm.llm import LLM
-from openhands.utils.prompt import PromptManager
-from openhands.utils.async_utils import call_sync_from_async, call_async_from_sync
 
-from swegym.harness.test_spec import make_test_spec
-from swegym.harness.run_evaluation import (
-    APPLY_PATCH_FAIL,
-    APPLY_PATCH_PASS,
-)
-from swegym.harness.grading import get_eval_report
-from openhands.events.action import CmdRunAction
-from openhands.events.observation import CmdOutputObservation
-from .utils import process_git_patch
+from .agent import OfflineRolloutAgent
 
-from mindforge_harness.run_instance import run_instance
 
-DOCKER_IMAGE_PREFIX = os.environ.get('EVAL_DOCKER_IMAGE_PREFIX', 'docker.io/xingyaoww/')
-logger.info(f'Using docker image prefix: {DOCKER_IMAGE_PREFIX}')
+def setup_logger(name: str):
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter('[%(asctime)s %(name)s-%(levelname)s] %(message)s')
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    return logger
+
+logger = setup_logger(__name__)
+
 
 # this is for the tokenizer.apply_chat_template to be able to generate assistant masks directly
 # todo: this is a hack, we should find a better way to do this
@@ -110,50 +61,6 @@ chat_template_qwen3_thinking = (
     "{% endfor %}"
 )
 
-async def run_mindforge_harness(docker_client, instance_args, patch):
-
-    try:
-        with open("patches.txt", "a") as f:
-            f.write(f"instance_id: {instance_args['instance_id']}")
-            f.write('-'*30)
-            f.write(patch)
-            f.write('-'*30)
-        root_dir = tempfile.mkdtemp()
-        logger.info(f"instance_id: {instance_args['instance_id']} saved to {root_dir}")
-        results = await run_instance(
-            client=docker_client,
-            repo=instance_args["repo"],
-            instance_id=instance_args["instance_id"],
-            base_commit=instance_args["base_commit"],
-            patches=[patch,instance_args["test_patch"]],
-            tests=instance_args["FAIL_TO_PASS"] + instance_args["PASS_TO_PASS"],
-            root_log_dir=root_dir,
-            spec_dict=instance_args.get("spec_dict", None),
-            timeout=300,
-            verbose=False,
-            short=True,
-            skipped_ok=True,
-            host_config= {"NetworkMode": "none", "NanoCpus": 2000000000, "Memory": 2147483648},
-        )
-        logger.info(f"Mindforge harness results for instance {instance_args['instance_id']}: {results}")
-        return results
-
-    except asyncio.TimeoutError:
-        logger.error(f"Timeout running mindforge the evaluation")
-        return {
-            test : False
-            for test in instance_args["FAIL_TO_PASS"] + instance_args["PASS_TO_PASS"]
-        }
-    except Exception as e:
-        logger.error(f"Error running mindforge harness: {e}")
-        return {
-            test : False
-            for test in instance_args["FAIL_TO_PASS"] + instance_args["PASS_TO_PASS"]
-        }
-    finally:    
-        if root_dir:
-            shutil.rmtree(root_dir, ignore_errors=True)
-    
 def convert_right_padding_to_left(tokenizer, input_ids, attention_mask, device, max_len=None):
     """
     Converts right-padded tensors to left-padded tensors with optional custom length.
@@ -249,347 +156,6 @@ def pad_to_max_length_right(tokenizer, encodings, max_length, device):
     return padded_input_ids, padded_attention_mask, padded_assistant_mask
 
 
-def codeact_user_response(
-    state: State,
-    encapsulate_solution: bool = False,
-    try_parse: Callable[[Action], str] | None = None,
-) -> str:
-    encaps_str = (
-        (
-            'Please encapsulate your final answer (answer ONLY) within <solution> and </solution>.\n'
-            'For example: The answer to the question is <solution> 42 </solution>.\n'
-        )
-        if encapsulate_solution
-        else ''
-    )
-    msg = (
-        'Please continue working on the task on whatever approach you think is suitable.\n'
-        'If you think you have solved the task, please first send your answer to user through message and then finish the interaction.\n'
-        f'{encaps_str}'
-        'IMPORTANT: YOU SHOULD NEVER ASK FOR HUMAN HELP.\n'
-    )
-
-    if state.history:
-        # check if the last action has an answer, if so, early exit
-        if try_parse is not None:
-            last_action = next(
-                (
-                    event
-                    for event in reversed(state.history)
-                    if isinstance(event, Action)
-                ),
-                None,
-            )
-            ans = try_parse(last_action)
-            if ans is not None:
-                return '/exit'
-
-        # check if the agent has tried to talk to the user 3 times, if so, let the agent know it can give up
-        user_msgs = [
-            event
-            for event in state.history
-            if isinstance(event, MessageAction) and event.source == 'user'
-        ]
-        if len(user_msgs) >= 2:
-            # let the agent know that it can give up when it has tried 3 times
-            return (
-                msg
-                + 'If you want to give up, use the "finish" tool to finish the interaction.\n'
-            )
-    return msg
-
-def get_instance_docker_image(instance_id: str) -> str:
-    image_name = 'sweb.eval.x86_64.' + instance_id
-    image_name = image_name.replace(
-        '__', '_s_'
-    )  # to comply with docker image naming convention
-    return (DOCKER_IMAGE_PREFIX.rstrip('/') + '/' + image_name).lower()
-
-# Helper function for sandbox config
-def get_default_sandbox_config_for_eval():
-    return SandboxConfig(
-        use_host_network=False,
-        timeout=300,
-        api_key=os.environ.get('ALLHANDS_API_KEY', None),
-        remote_runtime_api_url=os.environ.get('SANDBOX_REMOTE_RUNTIME_API_URL'),
-        keep_runtime_alive=False,
-        remote_runtime_init_timeout=3600,
-        remote_runtime_api_timeout=120,
-        remote_runtime_enable_retries=True,
-        remote_runtime_class='sysbox',
-    )
-
-class OnlineCodeActAgent(Agent):
-    """
-    An online implementation of CodeActAgent that leverages infer's asynchronous capabilities
-    for a single agent instance.
-    """
-    
-    def __init__(
-        self,
-        instance_id: int,
-        trajectory_id: int,
-        max_prompt_length: int = 1024,
-        infer_engine=None,
-        tokenizer=None,
-        sampling_params=None,
-        qwen3_enable_thinking: bool = True,
-    ) -> None:
-        """
-        Initialize a single OnlineCodeActAgent instance.
-        """
-        # dummy value to let openhands tracks the name
-        llm = LLM(LLMConfig(model="dummy"))
-
-        super().__init__(llm, AgentConfig())
-        
-        self.tokenizer = tokenizer
-        self.max_prompt_length = max_prompt_length
-        self.reset()
-        self.step_count = 0
-        self.infer_engine = infer_engine
-        self.sampling_params = sampling_params
-        
-        # Store instance and trajectory IDs separately
-        self.instance_id = instance_id
-        self.trajectory_id = trajectory_id
-        
-        # Initialize tools
-        self.tools = codeact_function_calling.get_tools(
-            codeact_enable_browsing=False,
-            codeact_enable_jupyter=False,
-            codeact_enable_llm_editor=False,
-        )
-        
-        # Initialize prompt manager
-        self.prompt_manager = PromptManager(
-            microagent_dir=os.path.join(
-                os.path.dirname(os.path.dirname(openhands.__file__)),
-                'microagents',
-            ),
-            prompt_dir=os.path.join(os.path.dirname(openhands.agenthub.codeact_agent.__file__), 'prompts'),
-            disabled_microagents=None,
-        )
-        
-        # Initialize condenser
-        self.condenser = Condenser.from_config(NoOpCondenserConfig())
-        
-        # Initialize state
-        self.pending_actions = deque()
-        
-        # will be set in _initialize_runtime_for_agent
-        self.runtime = None
-        self.instruction = None
-        self.config = None
-
-        self.qwen3_enable_thinking = qwen3_enable_thinking
-
-    def close(self):
-        """Close the agent runtime."""
-        if self.runtime:
-            # remove all threads in event stream
-            self.runtime.event_stream.close()
-            
-            self.runtime.close()
-
-
-        
-    def _initial_messages(self) -> list[Message]:
-        """Creates the initial messages (including the system prompt) for the LLM conversation."""
-        return [
-            Message(
-                role='system',
-                content=[
-                    TextContent(
-                        text=self.prompt_manager.get_system_message(),
-                        cache_prompt=False,  # Assuming caching is active
-                    )
-                ],
-            )
-        ]
-        
-    def _enhance_messages(self, messages: list[Message]) -> list[Message]:
-        """Enhances the user message with additional context based on keywords matched."""
-        results: list[Message] = []
-        is_first_message_handled = False
-
-        for msg in messages:
-            if msg.role == 'user' and not is_first_message_handled:
-                is_first_message_handled = True
-                # Compose the first user message with examples
-                self.prompt_manager.add_examples_to_initial_message(msg)
-
-                # Add repo/runtime info if enabled
-                if self.config.get_agent_config().enable_prompt_extensions:
-                    self.prompt_manager.add_info_to_initial_message(msg)
-
-            # Enhance the user message with additional context based on keywords matched
-            if msg.role == 'user':
-                self.prompt_manager.enhance_message(msg)
-
-            results.append(msg)
-
-        return results
-        
-    def _get_messages(self, state: State) -> List[Message]:
-        """Get the message history for this agent."""
-        # Start with initial messages (system prompt)
-        messages = self._initial_messages()
-        
-        # If using a condenser, condense the history
-        events = self.condenser.condensed_history(state)
-        
-        # Convert history events to messages
-        messages += events_to_messages(
-            events,
-            max_message_chars=32768,  # Default value, adjust as needed
-            vision_is_active=False,  # Assuming vision is not active
-            enable_som_visual_browsing=False,  # Assuming SOM visual browsing is not enabled
-        )
-        
-        messages = self._enhance_messages(messages)
-        
-        return messages
-
-    
-    # Conversion utility function
-    def convert_str_to_completion_format(self, fn_call_messages):
-        # from types import SimpleNamespace
-        from litellm import ModelResponse
-
-        role = fn_call_messages[0]['role']
-        response_str = fn_call_messages[0]['content']
-        tool_calls = fn_call_messages[0].get('tool_calls', None)
-        
-        return ModelResponse(
-            choices=[
-                {
-                    "index": 0,
-                    "message": {
-                        "content": response_str,
-                        "role": role,
-                        "tool_calls": tool_calls,
-                        "function_calling": None
-                    }
-                }
-            ]
-        )
-    
-    async def generate(self, input_ids, sampling_params):
-        res = await self.infer_engine.async_generate(input_ids=input_ids, sampling_params=self.sampling_params)
-        response_str = res["text"]
-        return response_str
-
-
-    async def step(self, state: State) -> Action:
-        """Generate a response using batched infer."""
-        self.step_count += 1
-        print(f"instance id {self.instance_id}, trajectory {self.trajectory_id}, step {self.step_count}")
-        if self.pending_actions:
-            return self.pending_actions.popleft()
-
-        # if we're done, go back
-        latest_user_message = state.get_last_user_message()
-        # if latest_user_message and not latest_user_message.content:
-        #     logger.error(f"instance id {self.instance_id}, trajectory {self.trajectory_id}, step {self.step_count}, latest_user_message: {latest_user_message}")
-        if latest_user_message and latest_user_message.content and latest_user_message.content.strip() == '/exit':
-            return AgentFinishAction()
-
-        # prepare what we want to send to the LLM
-        messages = self._get_messages(state)
-        messages = self.llm.format_messages_for_llm(messages)
-        messages = convert_fncall_messages_to_non_fncall_messages(
-                    messages, self.tools
-                )
-        
-        try:
-            input_ids = self.tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=True, enable_thinking=self.qwen3_enable_thinking
-            )
-            if len(input_ids) >= self.max_prompt_length:
-                return AgentFinishAction(thought="The context is too long. Exit now.")
-
-            response_str = call_async_from_sync(self.generate, input_ids=input_ids, sampling_params=self.sampling_params)
-            
-            if not response_str:
-                # If we got an empty response (possible error), return a message action
-                self.pending_actions.append(
-                    MessageAction(
-                        content="I encountered an error processing your request. Let's try again.",
-                    )
-                )
-            else:
-                # Convert to actions
-                message = [
-                    {
-                        'role': 'assistant',
-                        'content': response_str,
-                    }
-                ]
-                fn_call_messages = convert_non_fncall_messages_to_fncall_messages(
-                    message, self.tools
-                )
-                actions = codeact_function_calling.response_to_actions(
-                    self.convert_str_to_completion_format(fn_call_messages)
-                )
-                print(f"Take action: {type(actions)}")
-                
-                for action in actions:
-                    self.pending_actions.append(action)
-        
-        except (
-            LLMMalformedActionError,
-            LLMNoActionError,
-            LLMResponseError,
-            FunctionCallValidationError,
-            FunctionCallNotExistsError,
-        ):
-            raise
-
-        except Exception as e:
-            logger.error(f"Error in agent step: {str(e)}")
-            # Handle errors gracefully by creating a message action
-            self.pending_actions.append(
-                MessageAction(
-                    content=f"An error: {str(e)} encountered. Please try a different approach.",
-                )
-            )
-        
-        # Return the first pending action
-        if not self.pending_actions:
-            # Fallback in case of empty actions
-            return AgentFinishAction()
-            
-        return self.pending_actions.popleft()
-    
-    def get_final_messages(self, state: State) -> List[Message]:
-        """Get the final messages for this agent."""
-        messages = self._get_messages(state)
-        messages = self.llm.format_messages_for_llm(messages)
-        messages = convert_fncall_messages_to_non_fncall_messages(
-                    messages, self.tools
-                )
-        return messages
-    
-    def _is_last_action_finish(self, state: State) -> bool:
-        if state and state.history:
-            last_action = next(
-                (
-                    event
-                    for event in reversed(state.history)
-                    if isinstance(event, Action)
-                ),
-                None,
-            )
-            if isinstance(last_action, AgentFinishAction):
-                return True
-        return False
-    
-
-Agent.register('OnlineCodeActAgent', OnlineCodeActAgent) 
-
-
-
 class CodeActAgentGroup:
     """
     A class that manages multiple CodeActAgent instances to generate trajectories in parallel.
@@ -635,9 +201,9 @@ class CodeActAgentGroup:
         self.max_starting_message_length = max_starting_message_length
         self.max_parallel_agents = max_parallel_agents
         self.max_eval_parallel_agents = max_eval_parallel_agents
-        print("max eval parallel agents: ", self.max_eval_parallel_agents)
+        logger.info(f"max eval parallel agents: {self.max_eval_parallel_agents}")
         if max_eval_parallel_agents <= 0: 
-            print(f"`max_eval_parallel_agents` has not been set. Setting it to `max_parallel_agents` i.e {max_parallel_agents}")
+            logger.info(f"`max_eval_parallel_agents` has not been set. Setting it to `max_parallel_agents` i.e {max_parallel_agents}")
             self.max_eval_parallel_agents = max_parallel_agents
         self.max_iterations = max_iterations
         self.num_trajectories = num_trajectories
@@ -656,15 +222,11 @@ class CodeActAgentGroup:
         if log_messages_dir:
             self.log_messages_dir = Path(log_messages_dir)
             logger.info(f"Logging all messages to {self.log_messages_dir}")
-        
-        # Initialize agents for each instance
-        self._initialize_agents()
-        
+
         self.remove_think_tokens = remove_think_tokens
         if self.remove_think_tokens:
             logger.info("Removing think tokens....")
 
-        self.docker = None
 
     def _convert_results_to_dataproto(self) -> DataProto:
         """
@@ -685,62 +247,53 @@ class CodeActAgentGroup:
         error_list = []
         resolved_list = []
         has_finish_action_list = []
+        stop_reason_list = []
         
-        # Create a mapping of instance_id -> list of trajectories
-        instance_trajectories = {}
-        for instance_id, trajectories in self.results.items():
-            instance_trajectories[instance_id] = []
-            for trajectory_id, result in trajectories.items():
-                instance_trajectories[instance_id].append(result)
-
         # Create the final results in the same order as the batch
-        matched_results = []
-        instance_list = []
+        matched_results: list[dict[str, Any]] = []
+        instance_list: list[dict[str, Any]] = []
         for batch_item in self.batch:
             instance = json.loads(batch_item.non_tensor_batch['instance'])
             instance_id = instance['instance_id']
-            if instance_id in instance_trajectories:
+            if instance_id in self.results:
                 # Add all trajectories for this instance
-                traj_results = instance_trajectories[instance_id]
-                matched_results.extend(traj_results)
-                instance_list.extend([instance] * len(traj_results))
+                matched_results.extend(list(self.results[instance_id].values()))
+                instance_list.extend([instance] * len(self.results[instance_id]))
         
         assert len(matched_results) == self.num_trajectories * len(self.batch), f"Expected number of results {self.num_trajectories * len(self.batch)}, got {len(matched_results)}"
         
-        # Group results by instance_id for message handling
-        results_by_instance = {}
-        for i, result in enumerate(matched_results):
-            instance_id = instance_list[i]['instance_id']
-            if instance_id not in results_by_instance:
-                results_by_instance[instance_id] = []
-            results_by_instance[instance_id].append((i, result))
-        
+        SAVE_PATH = "samples"
+        os.makedirs(SAVE_PATH, exist_ok=True)
+        for iid, results in self.results.items():
+            with open(os.path.join(SAVE_PATH, f"{iid}.json"), "w") as f:
+                json.dump(results, f)
+
         # Handle empty messages by copying from another trajectory of the same instance
-        for instance_id, results in results_by_instance.items():
-            # Find a valid messages list to use as fallback
-            valid_messages = None
-            valid_patch = None
-            for _, result in results:
-                messages = result.get('messages', [])
-                if messages and len(messages) > 0:
-                    valid_messages = messages
-                    valid_patch = result.get('git_patch', None)
-                    valid_resolved = result.get('resolved', False)
-                    valid_finish = result.get('finish', False)
-                    valid_error = result.get('error', None)
-                    break
+        for offset in range(len(self.batch)):
+            start_idx = offset * self.num_trajectories
+            end_idx = (offset + 1) * self.num_trajectories
+            instance_trajectories = matched_results[start_idx:end_idx]
             
-            # If we found valid messages, use them for trajectories with empty messages
-            if valid_messages:
-                for idx, result in results:
-                    if not result.get('messages') or len(result.get('messages', [])) == 0:
-                        print(f"Got empty messages for instance_id {instance_id}, trajectory {idx}. Copying messages array from a valid trajectory. ")
-                        # Copy messages from the valid trajectory
-                        matched_results[idx]['messages'] = valid_messages.copy()
-                        matched_results[idx]['git_patch'] = valid_patch
-                        matched_results[idx]['resolved'] = valid_resolved
-                        matched_results[idx]['error'] = valid_error
-                        matched_results[idx]['finish'] = valid_finish
+            # Find first valid result to use as fallback
+            valid_result = next((result for result in instance_trajectories 
+                               if result.get('messages') and len(result.get('messages', [])) > 0), None)
+            
+
+            for i, result in enumerate(instance_trajectories):
+                if not result.get('messages') or len(result.get('messages', [])) == 0:
+                    instance_id = instance_list[start_idx + i]['instance_id']
+                    if valid_result:
+                        logger.warning(f"Got empty messages for instance_id {instance_id}, trajectory {i}. Copying messages array from a valid trajectory.")
+                        matched_results[start_idx + i].update({
+                            'messages': valid_result['messages'].copy(),
+                            'git_patch': valid_result.get('git_patch'),
+                            'resolved': valid_result.get('resolved', False),
+                            'error': valid_result.get('error'),
+                            'finish': valid_result.get('finish', False),
+                            'stop_reason': valid_result.get('stop_reason', '')
+                        })
+                    else:
+                        raise ValueError(f"Got empty messages for instance_id {instance_id}, trajectory {i}. No valid trajectory found.")
         
         # Get batch of messages
         all_messages = []
@@ -757,7 +310,7 @@ class CodeActAgentGroup:
                     break
             if starting_index == 0:
                 # If we don't find an assistant, all messages are prompts and there are no responses
-                print(f'ERROR: Found no assistant message. len(messages) == {len(messages)} and roles are {[msg["role"] for msg in messages]}')
+                logger.error(f'Found no assistant message {instance_id}. len(messages) == {len(messages)} and roles are {[msg["role"] for msg in messages]}')
                 starting_index = len(messages)
             prompt = messages[:starting_index]
             all_prompts.append(prompt)
@@ -770,7 +323,7 @@ class CodeActAgentGroup:
             error_list.append(result.get('error', None))
             resolved_list.append(result.get('resolved', False))
             has_finish_action_list.append(result.get('finish', False))
-
+            stop_reason_list.append(result.get('stop_reason', ''))
 
         # Encode messages, get assitant mask and position ids
         prompt_encodings = self.tokenizer.apply_chat_template(
@@ -822,6 +375,7 @@ class CodeActAgentGroup:
             'instance': instance_list,
             'resolved': resolved_list,
             'finish': has_finish_action_list,
+            'stop_reason': stop_reason_list,
         }
         
         # Create and return DataProto
@@ -841,596 +395,113 @@ class CodeActAgentGroup:
                 self._cleanup_agent(instance_id, trajectory_id)
     
     def _cleanup_agent(self, instance_id, trajectory_id):
-        try:
-            self.agents[instance_id][trajectory_id].close()
-        except Exception as e:
-            logger.warning(f"Error closing agent {instance_id}, trajectory {trajectory_id}: {str(e)}")
+        pass
     
     def __del__(self):
         """Destructor to ensure resources are cleaned up"""
         self.close()
-    
-    def _initialize_agents(self) -> None:
-        """Initialize agent instances for each task."""
+
+    async def generate_trajectories_pipeline(self) -> Dict[int, Dict[int, Dict[str, Any]]]:
+        
+        init_queue = asyncio.Queue()
+        complete_queue = asyncio.Queue()
+        self.results = {}
         for data_item in self.batch:
             instance = json.loads(data_item.non_tensor_batch['instance'])
-            instance_id = instance['instance_id']
-            self.agents[instance_id] = {}
-            for n in range(self.num_trajectories):
-                self.agents[instance_id][n] = OnlineCodeActAgent(
-                    instance_id=instance_id,
-                    trajectory_id=n,
-                    max_prompt_length=self.max_prompt_length,
-                    tokenizer=self.tokenizer,
-                    infer_engine=self.infer_engine,
-                    sampling_params=self.sampling_params,
-                    qwen3_enable_thinking=self.qwen3_enable_thinking
-                )
-                # Set the instance data for each agent
-                self.agents[instance_id][n].instance_data = data_item.non_tensor_batch['instance']
-                self.agents[instance_id][n].max_iterations = self.max_iterations
-    
-    async def _initialize_runtime_for_agent(self, batch_id: int, trajectory_id: int) -> None:
-        """Initialize the runtime for a specific agent."""
-        instance = json.loads(self.batch[batch_id].non_tensor_batch['instance'])
-        instance_id = instance['instance_id']
-        is_swegym = instance['data_source'] == 'swe-gym'
-        agent = self.agents[instance_id][trajectory_id]
+            for i in range(self.num_trajectories):
+                await init_queue.put((instance, i))
+            self.results[instance['instance_id']] = {}
         
-        try:
-            # Configure sandbox
-            if is_swegym:
-                RUN_WITH_BROWSING = os.environ.get('RUN_WITH_BROWSING', 'false').lower() == 'true'
-                SWE_BENCH_CONTAINER_IMAGE = 'ghcr.io/opendevin/eval-swe-bench:full-v1.2.1'
-                
-                if os.environ.get('USE_INSTANCE_IMAGE', 'true').lower() == 'true':
-                    # Use a different instance image for each instance of swe-bench eval
-                    base_container_image = get_instance_docker_image(instance_id)
-                else:
-                    base_container_image = SWE_BENCH_CONTAINER_IMAGE
-                    logger.info(f'Using swe-bench container image: {base_container_image}')
-            else:
-                base_container_image = instance['image']
-                if not self.docker:
-                    self.docker = aiodocker.Docker()
-            logger.info(f'Using instance container image: {base_container_image}.')    
-            
-            sandbox_config = get_default_sandbox_config_for_eval()
-            sandbox_config.base_container_image = base_container_image
-            sandbox_config.enable_auto_lint = True
-            sandbox_config.use_host_network = True
-            sandbox_config.platform = 'linux/amd64'
-            
-            app_config = AppConfig(
-                default_agent='OnlineCodeActAgent',
-                run_as_openhands=False,
-                max_iterations=self.max_iterations,
-                runtime='docker',
-                sandbox=sandbox_config,
-                workspace_base=None,
-                workspace_mount_path=None,
-            )
-            agent_config = AgentConfig(
-                codeact_enable_jupyter=False,
-                codeact_enable_browsing=False,
-                codeact_enable_llm_editor=False,
-                condenser=NoOpCondenserConfig(),
-                enable_prompt_extensions=False,
-            )
-            app_config.set_agent_config(agent_config)
-            agent.config = app_config
-            
-            # Create runtime
-            runtime = create_runtime(app_config)
-            
-            # Connect runtime
-            await runtime.connect()
-            
-            # Initialize runtime
-            from .utils import initialize_runtime, get_instruction, initialize_harness_runtime
-            # initialize_runtime(runtime, instance)
-            
-            if is_swegym:
-                await call_sync_from_async(initialize_runtime, runtime, instance)
-                agent.runtime = runtime
-                agent.istruction = get_instruction(instance, "/workspace/")
-            else:
-                await call_sync_from_async(initialize_harness_runtime, runtime, instance)
-                agent.runtime = runtime
-                agent.instruction = get_instruction(instance)
+        for _ in range(self.max_parallel_agents):
+            await init_queue.put(None)
 
-            logger.info(f"Successfully initialized runtime for instance {instance_id}")
-        except Exception as e:
-            logger.error(f"Failed to initialize runtime for instance {instance_id}: {str(e)}")
-            if 'runtime' in locals() and runtime:
-                runtime.event_stream.close()
-                runtime.close()
-            
-            # Update agent state to reflect error
-            agent.error = str(e)
-            agent.agent_state = AgentState.ERROR
-            raise
-    
-    async def _run_agent(self, batch_id: int, trajectory_id: int, pos_id: int) -> Dict[str, Any]:
-        instance = json.loads(self.batch[batch_id].non_tensor_batch['instance'])
-        instance_id = instance['instance_id']
-        """Run a single agent to completion and return the results."""
-        agent = self.agents[instance_id][trajectory_id]
-        assert agent is not None
-        is_swegym = instance['data_source'] == 'swe-gym'
-        runtime = agent.runtime
-        
-        try:
-            # Run the agent controller
-            state = await run_controller(
-                config=agent.config,
-                initial_user_action=MessageAction(content=agent.instruction),
-                runtime=runtime,
-                agent=agent,
-                fake_user_response_fn=codeact_user_response,
-            )
-
-            if state:
-                print(state.last_error)
-            
-            from .utils import complete_harness_runtime, is_fatal_evaluation_error, complete_runtime
-            # Check for fatal errors
-            if state and is_fatal_evaluation_error(state.last_error):
-                logger.error(f"Fatal error in agent {instance_id}: {state.last_error}")
-                raise Exception('Fatal error detected: ' + state.last_error)
-            
-            final_messages = agent.get_final_messages(state)
-            # Complete the runtime and get the git patch
-            if is_swegym:
-                return_val = await call_sync_from_async(complete_runtime, runtime, instance)
-            else:
-                return_val = await call_sync_from_async(complete_harness_runtime, runtime, instance)
-            # return_val = complete_runtime(runtime, instance)
-            # print patch
-            if return_val.get('git_patch', None):
-                print(f"Git patch for instance {instance_id}, traj {trajectory_id}:")
-                print('-' * 80)
-                print(return_val['git_patch'])
-                print('-' * 80)
-                
-            return_val =  {
-                'instance_id': instance_id,
-                'trajectory_id': trajectory_id,
-                'state': state,
-                'git_patch': return_val.get('git_patch', None),
-                'messages': final_messages,
-                'success': not bool(state.last_error if state else True),
-                'error': state.last_error if state and state.last_error else None,
-                'finish': agent._is_last_action_finish(state)
-            }
-        except Exception as e:
-            traceback.print_exc()
-            logger.error(f"Error running agent {instance_id}: {str(e)}")
-            # Update agent state to reflect error
-            agent.error = str(e)
-            agent.agent_state = AgentState.ERROR
-            
-            if state:
-                final_messages = agent.get_final_messages(state)
-            else:
-                print(f'No final message state for instance {instance_id}, trajectory {trajectory_id}')
-                final_messages = []
-
-            if not final_messages or len(final_messages) == 0:
-                print(f'1095: Final messages are non-existent (or empty) for instance {instance_id}, trajectory {trajectory_id}')
-            
-            return_val =  {
-                'instance_id': instance_id,
-                'trajectory_id': trajectory_id,
-                'messages': final_messages,
-                'state': state,
-                'git_patch': None,
-                'success': False,
-                'error': str(e),
-                'finish': agent._is_last_action_finish(state)
-            }
-        finally:
-            # cleanup agent resources
-            self._cleanup_agent(instance_id, trajectory_id)
-
-        return return_val
-    
-    def _apply_patch_and_evaluate(self, runtime, model_patch, instance_id, trajectory_id, test_spec):
-        """Apply patch and evaluate the solution."""
-        model_patch = process_git_patch(model_patch)
-        # Get patch and save it to /tmp/patch.diff
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Patch file
-            patch_file_path = os.path.join(temp_dir, 'patch.diff')
-            with open(patch_file_path, 'w') as f:
-                f.write(model_patch)
-            runtime.copy_to(patch_file_path, '/tmp')
-            # Eval script
-            eval_script_path = os.path.join(temp_dir, 'eval.sh')
-            with open(eval_script_path, 'w') as f:
-                f.write(test_spec.eval_script)
-            runtime.copy_to(eval_script_path, '/tmp')
-
-        # Set +x
-        action = CmdRunAction(command='chmod +x /tmp/eval.sh')
-        action.set_hard_timeout(600)
-        logger.info(action, extra={'msg_type': 'ACTION'})
-        obs = runtime.run_action(action)
-        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-        assert obs.exit_code == 0
-
-        # Apply patch
-        exec_command = (
-            'cd /testbed && '
-            "(git apply -v /tmp/patch.diff && echo 'APPLY_PATCH_PASS' || "
-            "(echo 'Failed to apply patch with git apply, trying with patch command...' && "
-            "(patch --batch --fuzz=5 -p1 -i /tmp/patch.diff && echo 'APPLY_PATCH_PASS' || "
-            "echo 'APPLY_PATCH_FAIL')))"
-        )
-        action = CmdRunAction(command=exec_command)
-        action.set_hard_timeout(600)
-        obs = runtime.run_action(action)
-        assert isinstance(obs, CmdOutputObservation)
-        apply_patch_output = obs.content
-        assert isinstance(apply_patch_output, str)
-        # instance['test_result']['apply_patch_output'] = apply_patch_output
-
-        if 'APPLY_PATCH_FAIL' in apply_patch_output:
-            raise Exception(f"Instance {instance_id}, trajectory {trajectory_id} {APPLY_PATCH_FAIL}:\n{apply_patch_output}")
-        elif 'APPLY_PATCH_PASS' in apply_patch_output:
-            logger.info(f'[{instance_id}, {trajectory_id}] {APPLY_PATCH_PASS}:\n{apply_patch_output}')
-
-            # Run eval script in background and save output to log file
-            log_file = '/tmp/eval_output.log'
-            action = CmdRunAction(command=f'/tmp/eval.sh > {log_file} 2>&1 & echo $!')
-            action.set_hard_timeout(300)  # Short timeout just to get the process ID
-            obs = runtime.run_action(action)
-
-            if isinstance(obs, CmdOutputObservation) and obs.exit_code == 0:
-                pid = obs.content.split()[-1].strip()
-                logger.info(
-                    f'[{instance_id}, {trajectory_id}] Evaluation process started with PID: {pid}'
+        MAX_RETRIES = 3 
+        async def initialize_one_agent():
+            while True:
+                instance_n_tid = await init_queue.get()
+                if not instance_n_tid:
+                    await complete_queue.put(None)
+                    break
+                instance, trajectory_id = instance_n_tid
+                assert isinstance(instance, dict), f"instance {instance} is not a dict"
+                assert 'data_source' in instance, f"data_source not found in instance {instance}"
+                logger.info(f"Initializing agent for {instance['instance_id']}-{trajectory_id}")
+                agent = OfflineRolloutAgent(
+                        logger=logger,
+                        instance=instance,
+                        trajectory_id=trajectory_id,
+                        max_prompt_length=self.max_prompt_length,
+                        tokenizer=self.tokenizer,
+                        infer_engine=self.infer_engine,
+                        sampling_params=self.sampling_params,
+                        qwen3_enable_thinking=self.qwen3_enable_thinking,
+                        max_iter=self.max_iterations
                 )
+                current_retries = 0
+                while current_retries < MAX_RETRIES:
+                    try:
+                        await agent.initialize()
+                        history, stop_reason = await agent.run()   # It will automatically retry if it fails
+                        await complete_queue.put((agent, instance, trajectory_id, history, stop_reason))
+                        break # Break out of the retry loop
+                    except Exception as e:
+                        current_retries += 1
+                        if current_retries >= MAX_RETRIES:
+                            raise e
+                        logger.error(f"Error in agent {instance['instance_id']}-{trajectory_id}: {e}. Retrying {current_retries} / {MAX_RETRIES}...")
+                        await asyncio.sleep(60)
 
-                # Poll for completion
-                start_time = time.time()
-                timeout = 1200  # 20 minutes
-                while True:
-                    seconds_elapsed = time.time() - start_time
-                    if seconds_elapsed > timeout:
-                        raise Exception(
-                            f'[{instance_id}, {trajectory_id}] Evaluation timed out after {timeout} seconds'
-                        )
-                    check_action = CmdRunAction(
-                        command=f'ps -p {pid} > /dev/null; echo $?'
-                    )
-                    check_action.set_hard_timeout(300)
-                    check_obs = runtime.run_action(check_action)
-                    if (
-                        isinstance(check_obs, CmdOutputObservation)
-                        and check_obs.content.split()[-1].strip() == '1'
-                    ):
-                        logger.info(
-                            f'[{instance_id}, {trajectory_id}] Evaluation process completed after {seconds_elapsed} seconds'
-                        )
+                await asyncio.sleep(0.1)
+        
+        async def complete_one_agent():
+            while True:
+                params = await complete_queue.get()
+                if not params:
+                    break
+                agent, instance, trajectory_id, history, stop_reason = params
+                logger.info(f"Completing agent for {instance['instance_id']}-{trajectory_id}")
+
+                current_retries = 0
+                while current_retries < MAX_RETRIES:
+                    try:
+                        patch, report = await agent.complete()
                         break
-                    logger.info(
-                        f'[{instance_id}, {trajectory_id}] [{seconds_elapsed:.0f}s] Evaluation still running, waiting...'
-                    )
-                    time.sleep(30)  # Wait for 30 seconds before checking again
+                    except Exception as e:
+                        current_retries += 1
+                        if current_retries >= MAX_RETRIES:
+                            raise e
+                        logger.error(f"Error in agent {instance['instance_id']}-{trajectory_id}: {e}. Retrying {current_retries} / {MAX_RETRIES}...")
+                        await asyncio.sleep(60)
+                        await agent.redo_previous_actions() # Redo previous actions to recover from the error
 
-                # Read the log file
-                cat_action = CmdRunAction(command=f'cat {log_file}')
-                cat_action.set_hard_timeout(300)
-                cat_obs = runtime.run_action(cat_action)
-
-                # Grade answer
-                if isinstance(cat_obs, CmdOutputObservation) and cat_obs.exit_code == 0:
-                    test_output = cat_obs.content
-                    assert isinstance(test_output, str)
-                    # instance['test_result']['test_output'] = test_output
-
-                    # Get report from test output
-                    logger.info(f'[{instance_id}, {trajectory_id}] Grading answer...')
-                    
-                    with tempfile.TemporaryDirectory() as temp_dir:
-                        # Create a directory structure that matches the expected format
-                        # NOTE: this is a hack to make the eval report format consistent
-                        # with the original SWE-Bench eval script
-                        log_dir = os.path.join(temp_dir, 'logs', instance_id.lower())
-                        os.makedirs(log_dir, exist_ok=True)
-                        test_output_path = os.path.join(log_dir, 'test_output.txt')
-                        with open(test_output_path, 'w') as f:
-                            f.write(test_output)
-                        try:
-                            _report = get_eval_report(
-                                test_spec=test_spec,
-                                prediction={
-                                    'model_patch': model_patch,
-                                    'instance_id': instance_id,
-                                },
-                                log_path=test_output_path,
-                                include_tests_status=True,
-                            )
-                            report = _report[instance_id]
-                            logger.info(
-                                f"[{instance_id}, {trajectory_id}] report: {report}\nResult for [{instance_id}, {trajectory_id}]: resolved: {report['resolved']}"
-                            )
-                            self.results[instance_id][trajectory_id]['resolved'] = report[
-                                'resolved'
-                            ]
-                        except Exception as e:
-                            logger.error(
-                                f'[{instance_id}, {trajectory_id}] Error when getting eval report: {e}'
-                            )
-                            self.results[instance_id][trajectory_id]['resolved'] = False
-            else:
-                raise Exception(f'[{instance_id}, {trajectory_id}] Error when starting eval:\n{obs.content}')
-        else:
-            raise Exception(
-                f'[{instance_id}] Unexpected output when applying patch:\n{apply_patch_output}'
-            )
-    
-    async def _evaluate_agent(self, batch_id: int, trajectory_id: int) -> None:
-        """Initialize the runtime for a specific agent."""
-        instance = json.loads(self.batch[batch_id].non_tensor_batch['instance'])
-        instance_id = instance['instance_id']
-        test_spec = make_test_spec(instance=instance)
-        
-        try:
-            # Configure sandbox
-            # We use a different instance image for the each instance of swe-bench eval
-            base_container_image = get_instance_docker_image(instance_id)
-            logger.info(
-                f'Using instance container image: {base_container_image}. '
-                f'Please make sure this image exists. '
-                f'Submit an issue on https://github.com/All-Hands-AI/OpenHands if you run into any issues.'
-            )
-            sandbox_config = get_default_sandbox_config_for_eval()
-            sandbox_config.base_container_image = base_container_image
-            sandbox_config.remote_runtime_resource_factor = 1
-            sandbox_config.use_host_network = True
-            config = AppConfig(
-                run_as_openhands=False,
-                runtime="docker",
-                sandbox=sandbox_config,
-                # do not mount workspace
-                workspace_base=None,
-                workspace_mount_path=None,
-            )
-            
-            # Create runtime
-            runtime = create_runtime(config)
-            
-            # Connect runtime
-            await runtime.connect()
-
-            assert instance_id in self.results and trajectory_id in self.results[instance_id], \
-            f"Instance {instance_id} or trajectory {trajectory_id} not found in results"
-            
-            model_patch = self.results[instance_id][trajectory_id].get('git_patch', None)
-            if not model_patch:
-                raise Exception(f"No git patch found for instance {instance_id}, trajectory {trajectory_id}")
-            
-            
-            await call_sync_from_async(self._apply_patch_and_evaluate, runtime, model_patch, instance_id, trajectory_id, test_spec)
-                
-        except Exception as e:
-            logger.error(f"Failed to evaluate traj {trajectory_id} for instance {instance_id}: {str(e)}")
-            self.results[instance_id][trajectory_id]['resolved'] = False
-            self.results[instance_id][trajectory_id]['eval_error'] = str(e)
-        finally:
-            if 'runtime' in locals() and runtime:
-                runtime.event_stream.close()
-                runtime.close()
-
-        if self.log_messages_dir:
-            result = self.results[instance_id][trajectory_id]
-            instance_dir  = self.log_messages_dir / str(instance_id) 
-            instance_dir.mkdir(exist_ok=True, parents=True)
-            with open(instance_dir / f"{trajectory_id}.json", "w") as f: 
-                result_json = json.dumps(result, default=lambda x: str(x))
-                f.write(result_json)
-    
-    async def generate_trajectories_pipeline(self) -> Dict[int, Dict[int, Dict[str, Any]]]:
-        """
-        Generate trajectories with pipelined runtime initialization to improve efficiency.
-        """
-        total_instances = len(self.batch)
-        print("Total instances:", total_instances)
-        
-        # Create two queues: one for initialization and one for running
-        init_queue = asyncio.Queue()
-        run_queue = asyncio.Queue(maxsize=self.max_parallel_agents)
-        eval_queue = asyncio.Queue(maxsize=self.max_parallel_agents)
-        
-        # Fill the initialization queue
-        for trajectory_id in range(self.num_trajectories):
-            for batch_idx in range(total_instances):
-                await init_queue.put((batch_idx, trajectory_id))
-        
-        # Track active tasks
-        active_init_tasks = set()
-        active_run_tasks = set()
-        active_eval_tasks = set()
-        need_init_tasks = self.num_trajectories * total_instances
-        needed_run_tasks = self.num_trajectories * total_instances  # Total tasks we'll eventually need   
-        needed_eval_tasks = self.num_trajectories * total_instances
-        
-        # Helper function to initialize runtime
-        import time
-        async def initialize_one_runtime():
-            start_time = time.time()
-            batch_idx, trajectory_id = await init_queue.get()
-            instance = json.loads(self.batch[batch_idx].non_tensor_batch['instance'])
-            instance_id = instance['instance_id']
-            try:
-                logger.info(f"Initializing runtime for instance {instance_id}, trajectory {trajectory_id}")
-                await self._initialize_runtime_for_agent(batch_idx, trajectory_id)
-                # Add to run queue after successful initialization
-                await run_queue.put((batch_idx, trajectory_id))
-                elpased_time = time.time() - start_time
-                print(f"Successfully initialized runtime for instance {instance_id}, trajectory {trajectory_id} in {elpased_time:.2f} seconds")
-            except Exception as e:
-                nonlocal needed_run_tasks
-                nonlocal needed_eval_tasks
-                needed_run_tasks -= 1
-                needed_eval_tasks -= 1
-                logger.error(f"Error initializing runtime for {instance_id}, trajectory {trajectory_id}: {str(e)}")
-                # Handle initialization error
-                if instance_id not in self.results:
-                    self.results[instance_id] = {}
-                self.results[instance_id][trajectory_id] = {
-                    'instance_id': instance_id,
-                    'trajectory_id': trajectory_id,
-                    'messages': [],
-                    'state': None,
-                    'git_patch': None,
-                    'success': False,
-                    'error': str(e),
-                    'finish': False,
-                    'resolved': False
-                }
-            finally:
-                init_queue.task_done()
-                # Start another initialization task if available
-                nonlocal need_init_tasks
-                if not init_queue.empty() and need_init_tasks > 0:
-                    need_init_tasks -= 1
-                    task = asyncio.create_task(initialize_one_runtime())
-                    active_init_tasks.add(task)
-                    task.add_done_callback(lambda t: active_init_tasks.discard(t))
-        
-        # Helper function to run one agent
-        async def run_one_agent(pos_id: int):
-            batch_idx, trajectory_id = await run_queue.get()
-            instance = json.loads(self.batch[batch_idx].non_tensor_batch['instance'])
-            instance_id = instance['instance_id']
-            start_time = time.time()
-            try:
-                logger.info(f"Running agent for instance {instance_id}, trajectory {trajectory_id}")
-                result = await self._run_agent(batch_idx, trajectory_id, pos_id)
-                elapsed = time.time() - start_time
-                
-                # Store the result
-                if instance_id not in self.results:
-                    self.results[instance_id] = {}
-                self.results[instance_id][trajectory_id] = result
-
-                await eval_queue.put((batch_idx, trajectory_id))
-                
-                print(f"Successfully completed instance {instance_id}, trajectory {trajectory_id} in {elapsed:.2f}s")
-            except Exception as e:
-                logger.error(f"[This line should not be reached!!] Error running agent for {instance_id}, trajectory {trajectory_id}: {str(e)}")
-                nonlocal needed_eval_tasks
-                needed_eval_tasks -= 1
-                # Store error result
-                if instance_id not in self.results:
-                    self.results[instance_id] = {}
-                self.results[instance_id][trajectory_id] = {
-                    'instance_id': instance_id,
-                    'trajectory_id': trajectory_id,
-                    'messages': [],
-                    'state': None,
-                    'git_patch': None,
-                    'success': False,
-                    'error': str(e),
-                    'finish': False,
-                    'resolved': False
-                }
-            finally:
-                run_queue.task_done()
-                nonlocal needed_run_tasks
-                # Start another run task if available
-                if needed_run_tasks > 0:
-                    needed_run_tasks -= 1
-                    task = asyncio.create_task(run_one_agent(pos_id))
-                    active_run_tasks.add(task)
-                    task.add_done_callback(lambda t: active_run_tasks.discard(t))
-        
-        # Helper function to eval one trajectory
-        async def eval_one_agent():
-            batch_idx, trajectory_id = await eval_queue.get()
-            instance = json.loads(self.batch[batch_idx].non_tensor_batch['instance'])
-            instance_id = instance['instance_id']
-            is_swegym = instance['data_source'] == 'swe-gym'
-            start_time = time.time()
-            try:
-                logger.info(f"Evaluating agent for instance {instance_id}, trajectory {trajectory_id}")
-                if is_swegym:
-                    await self._evaluate_agent(batch_idx, trajectory_id)
+                if report['status'] != 'success':
+                    error_msg = report.get('error', "")
+                    error = report['status'] + (f": {error_msg}" if error_msg else "")
                 else:
-                    model_patch = self.results[instance_id][trajectory_id].get('git_patch', None)
-                    if not model_patch:
-                        raise Exception(f"No git patch found for instance {instance_id}, trajectory {trajectory_id}")
-                    results = await run_mindforge_harness(self.docker, instance, model_patch)
-                    self.results[instance_id][trajectory_id]['resolved'] = all(res for res in results.values())
-                elapsed = time.time() - start_time
+                    error = None
                 
-                print(f"Successfully completed evaluating instance {instance_id}, trajectory {trajectory_id} in {elapsed:.2f}s")
-            except Exception as e:
-                logger.error(f"Error evaluating agent for {instance_id}, trajectory {trajectory_id}: {str(e)}")
-                # Store error result
-                self.results[instance_id][trajectory_id]['resolved'] = False
-            finally:
-                eval_queue.task_done()
-                nonlocal needed_eval_tasks
-                # Start another run task if available
-                if needed_eval_tasks > 0:
-                    needed_eval_tasks -= 1
-                    task = asyncio.create_task(eval_one_agent())
-                    active_eval_tasks.add(task)
-                    task.add_done_callback(lambda t: active_eval_tasks.discard(t))
-        
-        # Start initial batch of initialization tasks
-        max_parallel_init = self.max_parallel_agents  # Use some parallel initialization tasks
-        for _ in range(min(max_parallel_init, init_queue.qsize())):
-            need_init_tasks -= 1
-            task = asyncio.create_task(initialize_one_runtime())
-            active_init_tasks.add(task)
-            task.add_done_callback(lambda t: active_init_tasks.discard(t))
-        
-        # Start a few agent run tasks (they'll wait on the run_queue)
-        for pos_id in range(self.max_parallel_agents):
-            needed_run_tasks -= 1
-            task = asyncio.create_task(run_one_agent(pos_id))
-            active_run_tasks.add(task)
-            task.add_done_callback(lambda t: active_run_tasks.discard(t))
-        
-        for _ in range(self.max_eval_parallel_agents):
-            needed_eval_tasks -= 1
-            task = asyncio.create_task(eval_one_agent())
-            active_eval_tasks.add(task)
-            task.add_done_callback(lambda t: active_eval_tasks.discard(t))
-        
-        # Wait for all initialization tasks to complete
-        if init_queue.qsize() > 0:
-            await init_queue.join()
-        
-        # Wait for all run tasks to complete
-        if run_queue.qsize() > 0:
-            await run_queue.join()
-        
-        # Wait for all eval tasks to complete
-        if eval_queue.qsize() > 0:
-            await eval_queue.join()
-        
-        # Wait for any remaining active tasks
-        all_tasks = active_init_tasks.union(active_run_tasks)
-        all_tasks = all_tasks.union(active_eval_tasks)
-        if all_tasks:
-            logger.info(f"Waiting for {len(all_tasks)} (init: {len(active_init_tasks)}, run: {len(active_run_tasks)}, eval: {len(active_eval_tasks)}) remaining tasks to complete")
-            try:
-                timeout = 900
-                done, pending = await asyncio.wait(all_tasks, timeout=timeout)
-                if pending:
-                    logger.error(f"Pending tasks: {pending}")
-                    for task in pending:
-                        logger.error(f"Cancelling task {task}")
-                        task.cancel()
-            except Exception as e:
-                logger.error(f"Error waiting for tasks to complete: {str(e)}")
-        
+                self.results[instance['instance_id']][trajectory_id] = {
+                    'messages': history,
+                    'git_patch': patch,
+                    'resolved': report.get('resolved', False),
+                    'error': error,
+                    'finish': stop_reason == "Model finished",
+                    'stop_reason': stop_reason,
+                    'success': report['status'] != 'error'
+                }
+                await asyncio.sleep(0.1)
+
+        init_tasks = [initialize_one_agent() for _ in range(self.max_parallel_agents)]
+        complete_tasks = [complete_one_agent() for _ in range(self.max_parallel_agents)]
+        task_refs = [asyncio.create_task(task) for task in init_tasks + complete_tasks]
+
+        total_trajectories = len(self.batch) * self.num_trajectories
+        while not all(task.done() for task in task_refs):
+            finished = sum(len(result) for result in self.results.values())
+            pending = init_queue.qsize()
+            running = total_trajectories - finished - pending
+            logger.info(f"Finished {finished} / {total_trajectories} trajectories, pending {pending}, running {running}")
+            await asyncio.sleep(10)
         results_dataproto = self._convert_results_to_dataproto()
         return results_dataproto
     

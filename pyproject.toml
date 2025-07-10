@@ -43,14 +43,12 @@ dependencies=[
   'wandb',
   "hf_transfer",
   "torchdata",
-  "openhands-ai",
   'sglang[all]>=0.4.6.post1',
   "flash-attn@https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.5cxx11abifalse-cp312-cp312-linux_x86_64.whl",
   "streamlit",
   "whatthepatch",
   "retry",
   "evaluate",
-  "swebench@https://github.com/SWE-Gym/SWE-Bench-Fork.git",
   "swegym@https://github.com/SWE-Gym/SWE-Bench-Package.git",
   "commit0",
   "func_timeout",
@@ -66,6 +64,9 @@ dependencies=[
   'tensordict<=0.6.2',
   'torch-memory-saver>=0.0.5',
   'vllm>=0.7.3',
+  "mindforge>=1.0.0",
+  "pymongo>=4.13.2",
+  "ipykernel>=6.29.5",
   "mindforge-harness",
 ]
 
@@ -73,9 +74,7 @@ dependencies=[
 find-links = ["https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python"]
 override-dependencies = ["ray==2.43.0", "flash-attn@https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.5cxx11abifalse-cp312-cp312-linux_x86_64.whl", "xgrammar==0.1.17"]
 
-
 [tool.uv.sources]
-openhands-ai = { path = "./SkyRL-OpenHands", editable = true }
 mindforge-harness = { path = "Mindforge" }
 
 # -------------------------------

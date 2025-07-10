@@ -120,7 +120,9 @@ class SWEBenchRewardManager:
     def verify(self, data):
         resolved = data.non_tensor_batch['resolved']
         error = data.non_tensor_batch['error']
-        print(error)
+        stop_reasons = data.non_tensor_batch['stop_reason']
+        print("stop_reasons:", stop_reasons)
+        print("error:", error)
         has_finish_action = data.non_tensor_batch['finish']
         print("has_finish_action:", has_finish_action)
         score = [0. for _ in range(len(resolved))]
@@ -130,9 +132,9 @@ class SWEBenchRewardManager:
 
         print("scores:", score)
         reward_metrics = {}
-        reward_metrics['max_turn_ratio'] = sum("RuntimeError: Agent reached maximum iteration in headless mode" in e for e in error if e) / len(error)
+        reward_metrics['max_turn_ratio'] = sum("Max iterations reached" in r for r in stop_reasons if r) / len(stop_reasons)
         reward_metrics['finish_action_ratio'] = sum(has_finish_action) / len(has_finish_action)
-        reward_metrics['stuck_ratio'] = sum("stuck in a loop" in e for e in error if e) / len(error)
+        reward_metrics['stuck_ratio'] = sum("Agent is stuck in a loop" in r for r in stop_reasons if r) / len(stop_reasons)
 
         data.batch['acc'] = torch.tensor(score, dtype=torch.float32, device=data.batch['responses'].device)
         for ability in list(set(data.non_tensor_batch['ability'])):
